@@ -55,18 +55,20 @@ import (
 )
 
 const (
-	minSleep              = 10 * time.Millisecond
-	maxSleep              = 10 * time.Second
-	decayConstant         = 1    // bigger for slower decay, exponential
-	maxListChunkSize      = 5000 // number of items to read at once
-	modTimeKey            = "mtime"
-	dirMetaKey            = "hdi_isfolder"
-	sizeMetaKey           = "ghostd_size"
-	snapshotMetaKey       = "ghostd_snapshot"
-	refreshTimeMetaKey    = "ghostd_refresh_time"
-	dirMetaValue          = "true"
-	timeFormatIn          = time.RFC3339
-	timeFormatOut         = "2006-01-02T15:04:05.000000000Z07:00"
+	minSleep           = 10 * time.Millisecond
+	maxSleep           = 10 * time.Second
+	decayConstant      = 1    // bigger for slower decay, exponential
+	maxListChunkSize   = 5000 // number of items to read at once
+	modTimeKey         = "mtime"
+	dirMetaKey         = "hdi_isfolder"
+	sizeMetaKey        = "ghostd_size"
+	snapshotMetaKey    = "ghostd_snapshot"
+	refreshTimeMetaKey = "ghostd_refresh_time"
+	// Ghost block id format (24 chars): "ghostd++{BLOCK_INDEX:8}++{RANDOM:6}" ex. "ghostd++00000001++abcdef"
+	ghostBlockPrefix = "ghostd++"
+	dirMetaValue     = "true"
+	timeFormatIn     = time.RFC3339
+	timeFormatOut    = "2006-01-02T15:04:05.000000000Z07:00"
 	// snapshotTimeFormat is the format used by Azure for snapshot IDs (UTC, RFC3339Nano, no timezone)
 	snapshotTimeFormat    = "2006-01-02T15:04:05.0000000Z"
 	storageDefaultBaseURL = "blob.core.windows.net"
@@ -1185,58 +1187,82 @@ func isDirectoryMarker(size int64, metadata map[string]*string, remote string) b
 	return false
 }
 
-// commitUncommittedBlocksIfGhosted checks for sizeMetaKey, commits blocks if present, and removes the key.
-func (o *Object) commitUncommittedBlocksIfGhosted(ctx context.Context) error {
-	metadataMu.Lock()
-	_, ghosted := o.meta[sizeMetaKey]
-	metadataMu.Unlock()
+func deleteGhostMetadata[T any](metadata map[string]T) {
+	// Delete ghost metadata
+	delete(metadata, sizeMetaKey)
+	delete(metadata, refreshTimeMetaKey)
+	delete(metadata, snapshotMetaKey)
+}
 
-	if !ghosted {
-		return nil
+// commitUncommittedBlocksIfGhosted checks for sizeMetaKey, commits blocks if present, and removes the key.
+func (o *Object) materializeIfNeeded(ctx context.Context) (time.Time, error) {
+	minValidSnapshotTime := o.minValidSnapshotTime()
+
+	// Ghosting is not enabled.
+	// Or the current snapshot is up to date
+	if minValidSnapshotTime.IsZero() {
+		return time.Time{}, nil
 	}
 
-	metadata := o.getMetadata()
-	// Get block blob client
-	container, containerPath := o.split()
-	blb := o.fs.getBlockBlobSVC(container, containerPath)
+	if o.snapshotId.After(minValidSnapshotTime) {
+		return o.snapshotId, nil
+	}
 
-	// Get block list (both committed and uncommitted)
+	// Refresh metadata
+	_, err := o.readMetaDataAlways(ctx)
+	if err != nil || !o.ghost {
+		return time.Time{}, err
+	}
+
+	if o.snapshotId.After(minValidSnapshotTime) {
+		return o.snapshotId, nil
+	}
+
+	blb := o.getBlockBlobSVC()
+
+	// Get uncommitted block list
 	blockList, err := blb.GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
 	if err != nil {
-		return fmt.Errorf("failed to get block list: %w", err)
+		return time.Time{}, fmt.Errorf("failed to get block list: %w", err)
 	}
+
+	// TODO: What to do if there are unexpected blocks?
+	// We should only have ghost blocks in the uncommitted block list at rest.
+	hasUnexpectedBlocks := false
 
 	// Collect all uncommitted block IDs
 	blockIDs := make([]string, len(blockList.BlockList.UncommittedBlocks))
 	for _, b := range blockList.BlockList.UncommittedBlocks {
-		blockIDs = append(blockIDs, *b.Name)
+		if strings.HasPrefix(*b.Name, ghostBlockPrefix) {
+			blockIDs = append(blockIDs, *b.Name)
+		} else {
+			hasUnexpectedBlocks = true
+		}
 	}
 
 	// Sort blockIDs by block ID (lexicographically)
 	sort.Strings(blockIDs)
 
-	// Commit the block list
-	delete(metadata, sizeMetaKey)
-	delete(metadata, refreshTimeMetaKey)
-	delete(metadata, snapshotMetaKey)
-
-	// Set metadata as part of commit block list
-	options := blockblob.CommitBlockListOptions{
-		Metadata: metadata,
-	}
-	_, err = blb.CommitBlockList(ctx, blockIDs, &options)
+	_, err = blb.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to commit block list with metadata: %w", err)
+		return time.Time{}, fmt.Errorf("failed to commit block list with metadata: %w", err)
 	}
 
-	metadataMu.Lock()
-	defer metadataMu.Unlock()
-	// Update the object metadata
-	delete(o.meta, sizeMetaKey)
-	delete(o.meta, refreshTimeMetaKey)
-	delete(o.meta, snapshotMetaKey)
+	snapshotResponse, err := blb.CreateSnapshot(ctx, &blob.CreateSnapshotOptions{})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to snapshot blob: %w", err)
+	}
 
-	return nil
+	o.snapshotId = snapshotIDToTime(*snapshotResponse.Snapshot)
+	metadataMu.Lock()
+	o.meta[snapshotMetaKey] = *snapshotResponse.Snapshot
+	metadataMu.Unlock()
+	err = o.SetModTime(ctx, o.modTime)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to snapshot blob: %w", err)
+	}
+
+	return o.snapshotId, nil
 }
 
 func (fs *Fs) getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]*string) (size int64, ghost bool, snapshot time.Time) {
@@ -1956,9 +1982,14 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 		return nil, err
 	}
 
+	srcMetadata := srcProperties.Metadata
+
+	// We are creating a real (non-ghost) object, so don't propagate ghost metadata
+	deleteGhostMetadata(srcMetadata)
+
 	// Convert metadata from source object
 	options := blockblob.CommitBlockListOptions{
-		Metadata: srcProperties.Metadata,
+		Metadata: srcMetadata,
 		Tier:     parseTier(f.opt.AccessTier),
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobCacheControl:       srcProperties.CacheControl,
@@ -2828,6 +2859,10 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 			blockIDs = append(blockIDs, name)
 		}
 
+		TODO
+		// TODO: we maybe shouldn't destroy ghost blocks. In theory, this case may
+		// only happen when there is already a snapshot of the blob present.
+
 		// Reconstruct metadata from existing object as CommitBlockList overwrites it
 		options = &blockblob.CommitBlockListOptions{
 			Metadata: properties.Metadata,
@@ -2889,8 +2924,12 @@ func (w *azChunkWriter) Close(ctx context.Context) (err error) {
 		blockIDs[i] = w.blocks[i].id
 	}
 
+	finalMetadata := w.o.getMetadata()
+
+	// We are creating a non-empty blob, so remove ghost metadata
+	deleteGhostMetadata(finalMetadata)
 	options := blockblob.CommitBlockListOptions{
-		Metadata:    w.o.getMetadata(),
+		Metadata:    finalMetadata,
 		Tags:        w.o.getTags(),
 		Tier:        parseTier(w.f.opt.AccessTier),
 		HTTPHeaders: &w.ui.httpHeaders,
