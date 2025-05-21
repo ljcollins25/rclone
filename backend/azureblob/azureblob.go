@@ -61,6 +61,9 @@ const (
 	maxListChunkSize      = 5000 // number of items to read at once
 	modTimeKey            = "mtime"
 	dirMetaKey            = "hdi_isfolder"
+	sizeMetaKey           = "ghostd_size"
+	snapshotMetaKey       = "ghostd_snapshot"
+	refreshTimeMetaKey    = "ghostd_refresh_time"
 	dirMetaValue          = "true"
 	timeFormatIn          = time.RFC3339
 	timeFormatOut         = "2006-01-02T15:04:05.000000000Z07:00"
@@ -565,6 +568,7 @@ type Fs struct {
 type Object struct {
 	fs         *Fs               // what this object is part of
 	remote     string            // The remote path
+	ghost      bool              // Is this a ghost object?
 	modTime    time.Time         // The modified time of the object if known
 	md5        string            // MD5 hash if known
 	size       int64             // Size of the object
@@ -1132,6 +1136,80 @@ func isDirectoryMarker(size int64, metadata map[string]*string, remote string) b
 		}
 	}
 	return false
+}
+
+// commitUncommittedBlocksIfGhosted checks for sizeMetaKey, commits blocks if present, and removes the key.
+func (o *Object) commitUncommittedBlocksIfGhosted(ctx context.Context) error {
+	metadataMu.Lock()
+	_, ghosted := o.meta[sizeMetaKey]
+	metadataMu.Unlock()
+
+	if !ghosted {
+		return nil
+	}
+
+	metadata := o.getMetadata()
+	// Get block blob client
+	container, containerPath := o.split()
+	blb := o.fs.getBlockBlobSVC(container, containerPath)
+
+	// Get block list (both committed and uncommitted)
+	blockList, err := blb.GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get block list: %w", err)
+	}
+
+	// Collect all uncommitted block IDs
+	blockIDs := make([]string, len(blockList.BlockList.UncommittedBlocks))
+	for _, b := range blockList.BlockList.UncommittedBlocks {
+		blockIDs = append(blockIDs, *b.Name)
+	}
+
+	// Sort blockIDs by block ID (lexicographically)
+	sort.Strings(blockIDs)
+
+	// Commit the block list
+	delete(metadata, sizeMetaKey)
+	delete(metadata, refreshTimeMetaKey)
+	delete(metadata, snapshotMetaKey)
+
+	// Set metadata as part of commit block list
+	options := blockblob.CommitBlockListOptions{
+		Metadata: metadata,
+	}
+	_, err = blb.CommitBlockList(ctx, blockIDs, &options)
+	if err != nil {
+		return fmt.Errorf("failed to commit block list with metadata: %w", err)
+	}
+
+	metadataMu.Lock()
+	defer metadataMu.Unlock()
+	// Update the object metadata
+	delete(o.meta, sizeMetaKey)
+	delete(o.meta, refreshTimeMetaKey)
+	delete(o.meta, snapshotMetaKey)
+
+	return nil
+}
+
+func getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]*string) (int64, bool) {
+	var size int64
+	ghost := false
+	if contentLength == nil {
+		size = -1
+	} else {
+		size = *contentLength
+	}
+	if size == 0 {
+		for k, v := range metadata {
+			if v != nil && strings.EqualFold(k, sizeMetaKey) {
+				size, _ = strconv.ParseInt(*v, 10, 64)
+				ghost = true
+				break
+			}
+		}
+	}
+	return size, ghost
 }
 
 // listFn is called from list to handle an object
@@ -2042,12 +2120,8 @@ func (o *Object) getMetadata() (metadata map[string]*string) {
 //	o.meta
 func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesResponse) (err error) {
 	metadata := info.Metadata
-	var size int64
-	if info.ContentLength == nil {
-		size = -1
-	} else {
-		size = *info.ContentLength
-	}
+	size, ghost := getSizeFromContentLengthAndMetadata(info.ContentLength, metadata)
+	o.ghost = ghost
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
@@ -2077,12 +2151,8 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 
 func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamResponse) (err error) {
 	metadata := info.Metadata
-	var size int64
-	if info.ContentLength == nil {
-		size = -1
-	} else {
-		size = *info.ContentLength
-	}
+	size, ghost := getSizeFromContentLengthAndMetadata(info.ContentLength, metadata)
+	o.ghost = ghost
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
@@ -2132,12 +2202,9 @@ func (o *Object) decodeMetaDataFromBlob(info *container.BlobItem) (err error) {
 		return errors.New("nil Properties in decodeMetaDataFromBlob")
 	}
 	metadata := info.Metadata
-	var size int64
-	if info.Properties.ContentLength == nil {
-		size = -1
-	} else {
-		size = *info.Properties.ContentLength
-	}
+	size, ghost := getSizeFromContentLengthAndMetadata(info.Properties.ContentLength, metadata)
+	o.ghost = ghost
+
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
