@@ -67,6 +67,8 @@ const (
 	dirMetaValue          = "true"
 	timeFormatIn          = time.RFC3339
 	timeFormatOut         = "2006-01-02T15:04:05.000000000Z07:00"
+	// snapshotTimeFormat is the format used by Azure for snapshot IDs (UTC, RFC3339Nano, no timezone)
+	snapshotTimeFormat    = "2006-01-02T15:04:05.0000000Z"
 	storageDefaultBaseURL = "blob.core.windows.net"
 	defaultChunkSize      = 4 * fs.Mebi
 	defaultAccessTier     = blob.AccessTier("") // FIXME AccessTierNone
@@ -498,6 +500,17 @@ rclone does if you know the container exists already.
 			Default:   "",
 			Exclusive: true,
 			Advanced:  true,
+		}, {
+			Name: "ghostd_snapshot_ttl_minutes",
+			Help: `Set time to live in minutes for snapshots.
+
+Set to specify the expected time to live for ghost snapshots created for reads by rclone.
+
+Snapshots that are older than this value will not be used and a new snapshot will be created.
+
+Set to 0 to disable ghost behavior.`,
+			Default:  0,
+			Advanced: true,
 		}},
 	})
 }
@@ -540,6 +553,7 @@ type Options struct {
 	NoCheckContainer           bool                 `config:"no_check_container"`
 	NoHeadObject               bool                 `config:"no_head_object"`
 	DeleteSnapshots            string               `config:"delete_snapshots"`
+	GhostdSnapshotTTLMinutes   int                  `config:"ghostd_snapshot_ttl_minutes"`
 }
 
 // Fs represents a remote azure server
@@ -568,10 +582,11 @@ type Fs struct {
 type Object struct {
 	fs         *Fs               // what this object is part of
 	remote     string            // The remote path
-	ghost      bool              // Is this a ghost object?
 	modTime    time.Time         // The modified time of the object if known
 	md5        string            // MD5 hash if known
 	size       int64             // Size of the object
+	ghost      bool              // Whether this is a ghost object
+	snapshotId time.Time         // The snapshot ID of the object if known
 	mimeType   string            // Content-Type of the object
 	accessTier blob.AccessTier   // Blob Access Tier
 	meta       map[string]string // blob metadata - take metadataMu when accessing
@@ -612,6 +627,30 @@ func parsePath(path string) (root string) {
 	return
 }
 
+//
+// Functions for converting between Azure snapshot ID and time
+//
+
+// snapshotIDToTime parses an Azure snapshot ID string into time.Time.
+// Returns zero time and error if parsing fails.
+func snapshotIDToTime(snapshotID string) time.Time {
+	if snapshotID == "" {
+		return time.Time{}
+	}
+	// Azure snapshot IDs are always in UTC and end with 'Z'
+	t, err := time.Parse(snapshotTimeFormat, snapshotID)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// timeToSnapshotID formats a time.Time into an Azure snapshot ID string.
+// The time is always formatted in UTC.
+func timeToSnapshotID(t time.Time) string {
+	return t.UTC().Format(snapshotTimeFormat)
+}
+
 // split returns container and containerPath from the rootRelativePath
 // relative to f.root
 func (f *Fs) split(rootRelativePath string) (containerName, containerPath string) {
@@ -622,6 +661,14 @@ func (f *Fs) split(rootRelativePath string) (containerName, containerPath string
 // split returns container and containerPath from the object
 func (o *Object) split() (container, containerPath string) {
 	return o.fs.split(o.remote)
+}
+
+func (o *Object) minValidSnapshotTime() time.Time {
+	ttl := o.fs.opt.GhostdSnapshotTTLMinutes
+	if ttl <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(-time.Duration(ttl) * time.Minute)
 }
 
 // validateAccessTier checks if azureblob supports user supplied tier
@@ -1192,24 +1239,31 @@ func (o *Object) commitUncommittedBlocksIfGhosted(ctx context.Context) error {
 	return nil
 }
 
-func getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]*string) (int64, bool) {
-	var size int64
-	ghost := false
+func (fs *Fs) getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]*string) (size int64, ghost bool, snapshot time.Time) {
+	ghost = false
+	snapshot = time.Time{}
+	checkGhost := fs.opt.GhostdSnapshotTTLMinutes > 0
 	if contentLength == nil {
 		size = -1
 	} else {
 		size = *contentLength
 	}
-	if size == 0 {
+	if size == 0 && checkGhost {
 		for k, v := range metadata {
 			if v != nil && strings.EqualFold(k, sizeMetaKey) {
 				size, _ = strconv.ParseInt(*v, 10, 64)
 				ghost = true
 				break
 			}
+
+			if v != nil && strings.EqualFold(k, snapshotMetaKey) {
+				snapshot = snapshotIDToTime(*v)
+				break
+			}
 		}
 	}
-	return size, ghost
+
+	return
 }
 
 // listFn is called from list to handle an object
@@ -2120,8 +2174,9 @@ func (o *Object) getMetadata() (metadata map[string]*string) {
 //	o.meta
 func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesResponse) (err error) {
 	metadata := info.Metadata
-	size, ghost := getSizeFromContentLengthAndMetadata(info.ContentLength, metadata)
+	size, ghost, snapshotId := o.fs.getSizeFromContentLengthAndMetadata(info.ContentLength, metadata)
 	o.ghost = ghost
+	o.snapshotId = snapshotId
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
@@ -2151,8 +2206,9 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 
 func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamResponse) (err error) {
 	metadata := info.Metadata
-	size, ghost := getSizeFromContentLengthAndMetadata(info.ContentLength, metadata)
+	size, ghost, snapshotId := o.fs.getSizeFromContentLengthAndMetadata(info.ContentLength, metadata)
 	o.ghost = ghost
+	o.snapshotId = snapshotId
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
@@ -2202,9 +2258,9 @@ func (o *Object) decodeMetaDataFromBlob(info *container.BlobItem) (err error) {
 		return errors.New("nil Properties in decodeMetaDataFromBlob")
 	}
 	metadata := info.Metadata
-	size, ghost := getSizeFromContentLengthAndMetadata(info.Properties.ContentLength, metadata)
+	size, ghost, snapshotId := o.fs.getSizeFromContentLengthAndMetadata(info.Properties.ContentLength, metadata)
 	o.ghost = ghost
-
+	o.snapshotId = snapshotId
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
