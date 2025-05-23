@@ -382,9 +382,11 @@ type transporter struct {
 }
 
 // Make a new transporter
-func newTransporter(ctx context.Context) transporter {
-	return transporter{
-		RoundTripper: fshttp.NewTransport(ctx),
+func newTransporter(ctx context.Context) policy.Transporter {
+	return &http.Client{
+		Transport: transporter{
+			RoundTripper: fshttp.NewTransport(ctx),
+		},
 	}
 }
 

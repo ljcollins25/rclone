@@ -61,9 +61,18 @@ const (
 	maxListChunkSize      = 5000 // number of items to read at once
 	modTimeKey            = "mtime"
 	dirMetaKey            = "hdi_isfolder"
+	sizeMetaKey           = "ghostd_size"
+	snapshotMetaKey       = "ghostd_snapshot"
+	blockPrefixMetaKey    = "ghostd_block_prefix"
+	stateMetaKey          = "ghostd_state"
+	state_ghosted         = "ghost"
+	// Ghost block id format (24 chars): "ghostd++{BLOCK_INDEX:8}++{RANDOM:6}" ex. "ghostd++00000001++abcdef"
+	ghostMetaPrefix       = "ghostd_"
 	dirMetaValue          = "true"
 	timeFormatIn          = time.RFC3339
 	timeFormatOut         = "2006-01-02T15:04:05.000000000Z07:00"
+	// snapshotTimeFormat is the format used by Azure for snapshot IDs (UTC, RFC3339Nano, no timezone)
+	snapshotTimeFormat    = "2006-01-02T15:04:05.0000000Z"
 	storageDefaultBaseURL = "blob.core.windows.net"
 	defaultChunkSize      = 4 * fs.Mebi
 	defaultAccessTier     = blob.AccessTier("") // FIXME AccessTierNone
@@ -495,6 +504,17 @@ rclone does if you know the container exists already.
 			Default:   "",
 			Exclusive: true,
 			Advanced:  true,
+		}, {
+			Name: "ghostd_snapshot_ttl_minutes",
+			Help: `Set time to live in minutes for snapshots.
+
+Set to specify the expected time to live for ghost snapshots created for reads by rclone.
+
+Snapshots that are older than this value will not be used and a new snapshot will be created.
+
+Set to 0 to disable ghost behavior.`,
+			Default:  0,
+			Advanced: true,
 		}},
 	})
 }
@@ -537,6 +557,7 @@ type Options struct {
 	NoCheckContainer           bool                 `config:"no_check_container"`
 	NoHeadObject               bool                 `config:"no_head_object"`
 	DeleteSnapshots            string               `config:"delete_snapshots"`
+	GhostdSnapshotTTLMinutes   int                  `config:"ghostd_snapshot_ttl_minutes"`
 }
 
 // Fs represents a remote azure server
@@ -572,6 +593,14 @@ type Object struct {
 	accessTier blob.AccessTier   // Blob Access Tier
 	meta       map[string]string // blob metadata - take metadataMu when accessing
 	tags       map[string]string // blob tags
+
+	snapshot           *GhostSnapshotInfo // The snapshot info of the object if known
+	httpHeaders 	   *blob.HTTPHeaders  // HTTP headers of the object (tracked for setting http headers to update last modified time for ghostd)
+}
+
+type GhostSnapshotInfo struct {
+	id 	*string
+	ttl time.Time
 }
 
 // ------------------------------------------------------------
@@ -618,6 +647,14 @@ func (f *Fs) split(rootRelativePath string) (containerName, containerPath string
 // split returns container and containerPath from the object
 func (o *Object) split() (container, containerPath string) {
 	return o.fs.split(o.remote)
+}
+
+func (o *Object) minValidSnapshotTime() time.Time {
+	ttl := o.fs.opt.GhostdSnapshotTTLMinutes
+	if ttl <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(-time.Duration(ttl) * time.Minute)
 }
 
 // validateAccessTier checks if azureblob supports user supplied tier
@@ -1134,6 +1171,118 @@ func isDirectoryMarker(size int64, metadata map[string]*string, remote string) b
 	return false
 }
 
+func deleteGhostMetadata[T any](metadata map[string]T) map[string]T{
+	// Delete ghost metadata
+	for k := range metadata {
+		if strings.HasPrefix(k, ghostMetaPrefix) {
+			delete(metadata, k)
+		}
+	}
+
+	return metadata
+}
+
+// Materialize ghosted blob if needed and returns the snapshot id if content should be read from snapshot.
+func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
+	if (o.fs.opt.GhostdSnapshotTTLMinutes <= 0) {
+		// Ghost behavior is disabled
+		return nil, nil
+	}
+
+	snapshot := o.snapshot
+	if snapshot.ttl.After(time.Now()) {
+		return snapshot.id, nil
+	}
+
+	blb := o.getBlockBlobSVC()
+	if (o.httpHeaders != nil) {
+		o.readMetaDataAlways(ctx)
+	}
+
+	if (o.httpHeaders != nil) {
+		// Set the HTTP headers to update last modified time
+		// We use the current values so this should not change anything
+		// This will halt any further ghosting operations on this blob
+		// for a while
+		blb.SetHTTPHeaders(ctx, *o.httpHeaders, &blob.SetHTTPHeadersOptions{})
+	}
+	
+	// Refresh metadata
+	_, err := o.readMetaDataAlways(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshotId, exists := o.meta[snapshotMetaKey]
+	if exists {
+		// blob is in transitioning state
+		o.snapshot = &GhostSnapshotInfo{
+			id:  &snapshotId,
+			ttl: time.Now().Add(time.Duration(o.fs.opt.GhostdSnapshotTTLMinutes) * time.Minute),
+		}
+
+		return o.snapshot.id, nil
+	}
+
+	// Blob is either ghosted or active
+	state, exists := o.tags[stateMetaKey]
+	if exists && strings.EqualFold(state, "ghost") {
+		// blob is in ghost state - commit the blocks to make it active
+
+		// Get uncommitted block list
+		blockList, err := blb.GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get block list: %w", err)
+		}
+
+		ghostBlockPrefix := o.tags[blockPrefixMetaKey]
+
+		blockIDs := make([]string, len(blockList.BlockList.UncommittedBlocks))
+		for _, b := range blockList.BlockList.UncommittedBlocks {
+			if strings.HasPrefix(*b.Name, ghostBlockPrefix) {
+				blockIDs = append(blockIDs, *b.Name)
+			}
+		}
+
+		// Sort blockIDs by block ID (lexicographically)
+		sort.Strings(blockIDs)
+
+		_, err = blb.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to commit block list with metadata: %w", err)
+		}
+	}
+
+	// blob is now in active state
+	// update snapshot info to indicate that it will remain active
+	// for the next TTL period
+	o.snapshot = &GhostSnapshotInfo{
+		id:  nil,
+		ttl: time.Now().Add(time.Duration(o.fs.opt.GhostdSnapshotTTLMinutes) * time.Minute),
+	}
+
+	return nil, nil
+}
+
+func (fs *Fs) getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]string) (size int64) {
+	checkGhost := fs.opt.GhostdSnapshotTTLMinutes > 0
+	if contentLength == nil {
+		size = -1
+	} else {
+		size = *contentLength
+	}
+	for k, v := range metadata {
+			if size == 0 && len(metadata) > 0 && checkGhost {
+			if strings.EqualFold(k, sizeMetaKey) {
+				size, _ = strconv.ParseInt(v, 10, 64)
+				break
+			}
+		}
+	}
+
+	return
+}
+
 // listFn is called from list to handle an object
 type listFn func(remote string, object *container.BlobItem, isDirectory bool) error
 
@@ -1164,6 +1313,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 		Include: container.ListBlobsInclude{
 			Copy:             false,
 			Metadata:         true,
+			Tags:             true,
 			Snapshots:        false,
 			UncommittedBlobs: false,
 			Deleted:          false,
@@ -1827,6 +1977,8 @@ func (f *Fs) copyMultipart(ctx context.Context, remote, dstContainer, dstPath st
 	// Convert metadata from source object
 	options := blockblob.CommitBlockListOptions{
 		Metadata: srcProperties.Metadata,
+		// We are creating a real (non-ghost) object, so don't propagate ghost metadata
+		Tags:     deleteGhostMetadata(o.getTags()),
 		Tier:     parseTier(f.opt.AccessTier),
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobCacheControl:       srcProperties.CacheControl,
@@ -2040,17 +2192,14 @@ func (o *Object) getMetadata() (metadata map[string]*string) {
 //	o.size
 //	o.md5
 //	o.meta
-func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesResponse) (err error) {
+func (o *Object) decodeMetaDataFromPropertiesResponse(info *BlobMetadataResponse) (err error) {
 	metadata := info.Metadata
-	var size int64
-	if info.ContentLength == nil {
-		size = -1
-	} else {
-		size = *info.ContentLength
-	}
+	o.tags = info.Tags
+	size := o.fs.getSizeFromContentLengthAndMetadata(info.ContentLength, o.tags)
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
+
 	// NOTE - Client library always returns MD5 as base64 decoded string, Object needs to maintain
 	// this as base64 encoded string.
 	o.md5 = base64.StdEncoding.EncodeToString(info.ContentMD5)
@@ -2059,6 +2208,16 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 	} else {
 		o.mimeType = *info.ContentType
 	}
+
+	o.httpHeaders = &blob.HTTPHeaders{
+		BlobContentType: info.ContentType,
+		BlobCacheControl: info.CacheControl,
+		BlobContentDisposition: info.ContentDisposition,
+		BlobContentEncoding: info.ContentEncoding,
+		BlobContentLanguage: info.ContentLanguage,
+		BlobContentMD5: info.ContentMD5,
+	}
+
 	o.size = size
 	if info.LastModified == nil {
 		o.modTime = time.Now()
@@ -2077,12 +2236,7 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 
 func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamResponse) (err error) {
 	metadata := info.Metadata
-	var size int64
-	if info.ContentLength == nil {
-		size = -1
-	} else {
-		size = *info.ContentLength
-	}
+	size := o.fs.getSizeFromContentLengthAndMetadata(info.ContentLength, nil/* metadata not needed size we are downloading from a real blob */)
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
@@ -2095,6 +2249,16 @@ func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamRes
 		o.mimeType = *info.ContentType
 	}
 	o.size = size
+
+	o.httpHeaders = &blob.HTTPHeaders{
+		BlobContentType: info.ContentType,
+		BlobCacheControl: info.CacheControl,
+		BlobContentDisposition: info.ContentDisposition,
+		BlobContentEncoding: info.ContentEncoding,
+		BlobContentLanguage: info.ContentLanguage,
+		BlobContentMD5: info.ContentMD5,
+	}
+
 	if info.LastModified == nil {
 		o.modTime = time.Now()
 	} else {
@@ -2132,12 +2296,8 @@ func (o *Object) decodeMetaDataFromBlob(info *container.BlobItem) (err error) {
 		return errors.New("nil Properties in decodeMetaDataFromBlob")
 	}
 	metadata := info.Metadata
-	var size int64
-	if info.Properties.ContentLength == nil {
-		size = -1
-	} else {
-		size = *info.Properties.ContentLength
-	}
+	o.tags = parseTags(info.BlobTags)
+	size := o.fs.getSizeFromContentLengthAndMetadata(info.Properties.ContentLength, o.tags)
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
@@ -2196,7 +2356,7 @@ func (o *Object) clearMetaData() {
 }
 
 // readMetaData gets the metadata if it hasn't already been fetched
-func (f *Fs) readMetaData(ctx context.Context, container, containerPath string) (blobProperties *blob.GetPropertiesResponse, err error) {
+func (f *Fs) readMetaData(ctx context.Context, container, containerPath string) (blobProperties *BlobMetadataResponse, err error) {
 	if !f.containerOK(container) {
 		return nil, fs.ErrorObjectNotFound
 	}
@@ -2204,9 +2364,12 @@ func (f *Fs) readMetaData(ctx context.Context, container, containerPath string) 
 
 	// Read metadata (this includes metadata)
 	options := blob.GetPropertiesOptions{}
+	tagOptions := blob.GetTagsOptions{}
 	var resp blob.GetPropertiesResponse
+	var tagResp blob.GetTagsResponse
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = blb.GetProperties(ctx, &options)
+		tagResp, err = blb.GetTags(ctx, &tagOptions)
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -2216,7 +2379,30 @@ func (f *Fs) readMetaData(ctx context.Context, container, containerPath string) 
 		}
 		return nil, err
 	}
-	return &resp, nil
+
+	result := BlobMetadataResponse{
+		GetPropertiesResponse: resp,
+		Tags: parseTags(&tagResp.BlobTags),
+	}
+
+	return &result, nil
+}
+
+// parseTags converts blob tag response into a simple string map
+// It also handles URL decoding of tag values which Azure sometimes requires
+func parseTags(blobTags *container.BlobTags) map[string]string {
+    if blobTags == nil || len(blobTags.BlobTagSet) == 0 {
+        return nil
+    }
+    
+    tags := make(map[string]string)
+	for _, tag := range blobTags.BlobTagSet {
+		if tag.Key != nil && tag.Value != nil {
+			tags[*tag.Key] = *tag.Value
+		}
+	}
+
+	return tags;
 }
 
 // readMetaDataAlways gets the metadata unconditionally and also the blob properties.
@@ -2227,7 +2413,7 @@ func (f *Fs) readMetaData(ctx context.Context, container, containerPath string) 
 //	o.modTime
 //	o.size
 //	o.md5
-func (o *Object) readMetaDataAlways(ctx context.Context) (blobProperties *blob.GetPropertiesResponse, err error) {
+func (o *Object) readMetaDataAlways(ctx context.Context) (blobProperties *BlobMetadataResponse, err error) {
 	container, containerPath := o.split()
 	blobProperties, err = o.fs.readMetaData(ctx, container, containerPath)
 	if err != nil {
@@ -2353,6 +2539,12 @@ func pString(s string) *string {
 type readSeekCloser struct {
 	io.Reader
 	io.Seeker
+}
+
+// BlobMetadataResponse combines fields from both GetPropertiesResponse and GetTagsResponse
+type BlobMetadataResponse struct {
+    blob.GetPropertiesResponse
+    Tags map[string]string
 }
 
 // Close does nothing
@@ -2667,7 +2859,7 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 		objectExists = true
 		blockIDs     []string
 		blockList    blockblob.GetBlockListResponse
-		properties   *blob.GetPropertiesResponse
+		properties   *BlobMetadataResponse
 		options      *blockblob.CommitBlockListOptions
 	)
 
@@ -2704,6 +2896,10 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 			}
 			blockIDs = append(blockIDs, name)
 		}
+
+		// TODO: we maybe shouldn't destroy ghost blocks. In theory, this case may
+		// only happen when there is already a snapshot of the blob present.
+		SETOSID
 
 		// Reconstruct metadata from existing object as CommitBlockList overwrites it
 		options = &blockblob.CommitBlockListOptions{
@@ -2768,7 +2964,8 @@ func (w *azChunkWriter) Close(ctx context.Context) (err error) {
 
 	options := blockblob.CommitBlockListOptions{
 		Metadata:    w.o.getMetadata(),
-		Tags:        w.o.getTags(),
+		// We are creating a non-empty blob, so remove ghost metadata
+		Tags:        deleteGhostMetadata(w.o.getTags()),
 		Tier:        parseTier(w.f.opt.AccessTier),
 		HTTPHeaders: &w.ui.httpHeaders,
 	}
@@ -2824,7 +3021,7 @@ func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, size int64,
 
 	options := blockblob.UploadOptions{
 		Metadata:    o.getMetadata(),
-		Tags:        o.getTags(),
+		Tags:        deleteGhostMetadata(o.getTags()),
 		Tier:        parseTier(o.fs.opt.AccessTier),
 		HTTPHeaders: &ui.httpHeaders,
 	}
