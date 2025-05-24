@@ -65,14 +65,14 @@ const (
 	snapshotMetaKey       = "ghostd_snapshot"
 	blockPrefixMetaKey    = "ghostd_block_prefix"
 	stateMetaKey          = "ghostd_state"
+	// indicates that blob is in dirty state and should be cleaned up by ghoster
+	dirtyTimeMetaKey      = "ghostd_dirty_time"
+	timestampTimeFormat   = "2006-01-02T15:04:05.0000000Z" // use for last mod time in dirty metadata value
 	state_ghosted         = "ghost"
-	// Ghost block id format (24 chars): "ghostd++{BLOCK_INDEX:8}++{RANDOM:6}" ex. "ghostd++00000001++abcdef"
 	ghostMetaPrefix       = "ghostd_"
 	dirMetaValue          = "true"
 	timeFormatIn          = time.RFC3339
 	timeFormatOut         = "2006-01-02T15:04:05.000000000Z07:00"
-	// snapshotTimeFormat is the format used by Azure for snapshot IDs (UTC, RFC3339Nano, no timezone)
-	snapshotTimeFormat    = "2006-01-02T15:04:05.0000000Z"
 	storageDefaultBaseURL = "blob.core.windows.net"
 	defaultChunkSize      = 4 * fs.Mebi
 	defaultAccessTier     = blob.AccessTier("") // FIXME AccessTierNone
@@ -1213,7 +1213,7 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 		return nil, err
 	}
 
-	snapshotId, exists := o.meta[snapshotMetaKey]
+	snapshotId, exists := o.tags[snapshotMetaKey]
 	if exists {
 		// blob is in transitioning state
 		o.snapshot = &GhostSnapshotInfo{
@@ -1847,7 +1847,17 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // If tokenOK is true it may also return a token for the auth.
 func (o *Object) getAuth(ctx context.Context, tokenOK bool, noAuth bool) (srcURL string, token *string, err error) {
 	f := o.fs
+
+	snapshotId, err := o.materializeIfNeeded(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to materialize source object: %w", err)
+	}
+
 	srcBlobSVC := o.getBlobSVC()
+	if snapshotId != nil {
+		srcBlobSVC, _ = srcBlobSVC.WithSnapshot(*snapshotId)
+	}
+
 	srcURL = srcBlobSVC.URL()
 
 	switch {
@@ -2476,6 +2486,8 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	o.materializeIfNeeded(ctx)
+
 	// Offset and Count for range download
 	var offset int64
 	var count int64
@@ -2864,6 +2876,7 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 	)
 
 	properties, err = o.readMetaDataAlways(ctx)
+
 	if err == fs.ErrorObjectNotFound {
 		objectExists = false
 	} else if err != nil {
@@ -2871,6 +2884,27 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 	}
 
 	if objectExists {
+		if o.fs.opt.GhostdSnapshotTTLMinutes > 0 {
+			// ghosting enabled
+
+			// force a refresh of the blob by the ghoster
+			timestamp := properties.Date.Format(timestampTimeFormat)
+
+			// update metadata so dirty metadata is preserved
+			metadataMu.Lock()
+			o.meta[dirtyTimeMetaKey] = timestamp
+			metadataMu.Unlock()
+
+			// set the metadata			
+			err = o.fs.pacer.Call(func() (bool, error) {
+				_, err = blockBlobSVC.SetMetadata(ctx, o.getMetadata(), &blob.SetMetadataOptions{})
+				return o.fs.shouldRetry(ctx, err)
+			})
+			if err != nil {
+				return fmt.Errorf("clear uncommitted blocks: set metadata: %w", err)
+			}
+			return nil
+		}
 		// Get the committed block list
 		err = o.fs.pacer.Call(func() (bool, error) {
 			blockList, err = blockBlobSVC.GetBlockList(ctx, blockblob.BlockListTypeAll, nil)
@@ -2896,10 +2930,6 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 			}
 			blockIDs = append(blockIDs, name)
 		}
-
-		// TODO: we maybe shouldn't destroy ghost blocks. In theory, this case may
-		// only happen when there is already a snapshot of the blob present.
-		SETOSID
 
 		// Reconstruct metadata from existing object as CommitBlockList overwrites it
 		options = &blockblob.CommitBlockListOptions{
