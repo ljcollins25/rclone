@@ -173,7 +173,7 @@ jobs:
           rclone version
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: rclone-exe-${{ matrix.job_name }}
           path: rclone${{ matrix.os  == 'windows-latest' && '.exe' || ''  }}
