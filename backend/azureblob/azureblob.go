@@ -1183,7 +1183,7 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 	}
 
 	snapshot := o.snapshot
-	if snapshot.ttl.After(time.Now()) {
+	if snapshot != nil && snapshot.ttl.After(time.Now()) {
 		return snapshot.id, nil
 	}
 
@@ -1266,7 +1266,7 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 
 		ghostBlockPrefix := o.tags[blockPrefixMetaKey]
 
-		blockIDs := make([]string, len(blockList.BlockList.UncommittedBlocks))
+		blockIDs := []string{}
 		for _, b := range blockList.BlockList.UncommittedBlocks {
 			if strings.HasPrefix(*b.Name, ghostBlockPrefix) {
 				blockIDs = append(blockIDs, *b.Name)
@@ -1291,7 +1291,7 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 	// for the next TTL period
 	o.snapshot = &GhostSnapshotInfo{
 		id:  nil,
-		ttl: time.Now().Add(time.Duration(o.fs.opt.GhostdSnapshotTTLMinutes) * time.Minute),
+		ttl: time.Now().Add(retentionDuration),
 	}
 
 	return nil, nil
