@@ -63,6 +63,7 @@ const (
 	dirMetaKey            = "hdi_isfolder"
 	sizeMetaKey           = "ghostd_size"
 	snapshotMetaKey       = "ghostd_snapshot"
+	lastAccessMetaKey     = "ghostd_last_access"
 	blockPrefixMetaKey    = "ghostd_block_prefix"
 	stateMetaKey          = "ghostd_state"
 	// indicates that blob is in dirty state and should be cleaned up by ghoster
@@ -649,14 +650,6 @@ func (o *Object) split() (container, containerPath string) {
 	return o.fs.split(o.remote)
 }
 
-func (o *Object) minValidSnapshotTime() time.Time {
-	ttl := o.fs.opt.GhostdSnapshotTTLMinutes
-	if ttl <= 0 {
-		return time.Time{}
-	}
-	return time.Now().Add(-time.Duration(ttl) * time.Minute)
-}
-
 // validateAccessTier checks if azureblob supports user supplied tier
 func validateAccessTier(tier string) bool {
 	return strings.EqualFold(tier, string(blob.AccessTierHot)) ||
@@ -1195,18 +1188,54 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 	}
 
 	blb := o.getBlockBlobSVC()
-	if (o.httpHeaders != nil) {
+
+	retentionDuration := time.Duration(o.fs.opt.GhostdSnapshotTTLMinutes) * time.Minute
+
+	for i := 0; i < 6; i++ {
 		o.readMetaDataAlways(ctx)
+		state, exists := o.tags[stateMetaKey]
+		if strings.EqualFold(state, "active") {
+			ttl := o.modTime.Add(retentionDuration)
+			if (time.Now().Before(ttl)) {
+				o.snapshot = &GhostSnapshotInfo{
+					id:  nil,
+					ttl: ttl,
+				}
+
+				// Blob is active and was modified recently, no need to ghost it
+				return nil, nil
+			}
+		}
+
+		var expectedState string
+		if !exists {
+			expectedState = "null"
+		} else {
+			expectedState = fmt.Sprintf("'%s'", state)
+		}
+
+		updatedTags := o.getTags()
+		updatedTags[lastAccessMetaKey] = time.Now().Format(timestampTimeFormat)
+
+		tagCondition := fmt.Sprintf("%s=%s", stateMetaKey, expectedState)
+		_, err := blb.SetTags(ctx, updatedTags, &blob.SetTagsOptions{
+			AccessConditions: &blob.AccessConditions{
+				ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+					IfTags: &tagCondition,
+				},
+			},
+		})
+
+		// Check if error is a request condition failed error (RequestConditionNotMet)
+		var respErr *azcore.ResponseError
+		if err != nil && errors.As(err, &respErr) && respErr.ErrorCode == string(bloberror.ConditionNotMet) {
+			// Condition not met, need to try again
+		} else {
+			break
+		}
+
 	}
 
-	if (o.httpHeaders != nil) {
-		// Set the HTTP headers to update last modified time
-		// We use the current values so this should not change anything
-		// This will halt any further ghosting operations on this blob
-		// for a while
-		blb.SetHTTPHeaders(ctx, *o.httpHeaders, &blob.SetHTTPHeadersOptions{})
-	}
-	
 	// Refresh metadata
 	_, err := o.readMetaDataAlways(ctx)
 	if err != nil {
@@ -1218,7 +1247,7 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 		// blob is in transitioning state
 		o.snapshot = &GhostSnapshotInfo{
 			id:  &snapshotId,
-			ttl: time.Now().Add(time.Duration(o.fs.opt.GhostdSnapshotTTLMinutes) * time.Minute),
+			ttl: time.Now().Add(retentionDuration),
 		}
 
 		return o.snapshot.id, nil
@@ -1244,12 +1273,16 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 			}
 		}
 
-		// Sort blockIDs by block ID (lexicographically)
-		sort.Strings(blockIDs)
+		// Check if someone else has committed the block list first
+		// i.e. no matching uncommitted blocks
+		if (len(blockIDs) != 0) {
+			// Sort blockIDs by block ID (lexicographically)
+			sort.Strings(blockIDs)
 
-		_, err = blb.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to commit block list with metadata: %w", err)
+			_, err = blb.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to commit block list with metadata: %w", err)
+			}
 		}
 	}
 
@@ -1264,8 +1297,8 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 	return nil, nil
 }
 
-func (fs *Fs) getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]string) (size int64) {
-	checkGhost := fs.opt.GhostdSnapshotTTLMinutes > 0
+func (f *Fs) getSizeFromContentLengthAndMetadata(contentLength *int64, metadata map[string]string) (size int64) {
+	checkGhost := f.opt.GhostdSnapshotTTLMinutes > 0
 	if contentLength == nil {
 		size = -1
 	} else {
@@ -2935,14 +2968,6 @@ func (o *Object) clearUncommittedBlocks(ctx context.Context) (err error) {
 		options = &blockblob.CommitBlockListOptions{
 			Metadata: properties.Metadata,
 			Tier:     (*blob.AccessTier)(properties.AccessTier),
-			HTTPHeaders: &blob.HTTPHeaders{
-				BlobCacheControl:       properties.CacheControl,
-				BlobContentDisposition: properties.ContentDisposition,
-				BlobContentEncoding:    properties.ContentEncoding,
-				BlobContentLanguage:    properties.ContentLanguage,
-				BlobContentMD5:         properties.ContentMD5,
-				BlobContentType:        properties.ContentType,
-			},
 		}
 	}
 
@@ -2997,7 +3022,7 @@ func (w *azChunkWriter) Close(ctx context.Context) (err error) {
 		// We are creating a non-empty blob, so remove ghost metadata
 		Tags:        deleteGhostMetadata(w.o.getTags()),
 		Tier:        parseTier(w.f.opt.AccessTier),
-		HTTPHeaders: &w.ui.httpHeaders,
+		//HTTPHeaders: &w.ui.httpHeaders,
 	}
 
 	// Finalise the upload session
