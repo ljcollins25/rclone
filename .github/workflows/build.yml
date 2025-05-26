@@ -178,6 +178,16 @@ jobs:
           name: rclone-exe-${{ matrix.job_name }}
           path: rclone${{ matrix.os  == 'windows-latest' && '.exe' || ''  }}
 
+      - name: Release artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          name: contrib
+          tag_name: contrib
+          prerelease: true
+          files: |
+            rclone${{ matrix.os  == 'windows-latest' && '.exe' || ''  }}
+        if: matrix.os == 'windows-latest'
+
       - name: Run tests
         shell: bash
         run: |
