@@ -1215,7 +1215,7 @@ func (o *Object) materializeIfNeeded(ctx context.Context) (*string, error) {
 		}
 
 		updatedTags := o.getTags()
-		updatedTags[lastAccessMetaKey] = time.Now().Format(timestampTimeFormat)
+		updatedTags[lastAccessMetaKey] = time.Now().UTC().Format(timestampTimeFormat)
 
 		tagCondition := fmt.Sprintf("%s=%s", stateMetaKey, expectedState)
 		_, err := blb.SetTags(ctx, updatedTags, &blob.SetTagsOptions{
