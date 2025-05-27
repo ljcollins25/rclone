@@ -2519,7 +2519,10 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	o.materializeIfNeeded(ctx)
+	snapshotId, err := o.materializeIfNeeded(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to materialize object: %w", err)
+	}
 
 	// Offset and Count for range download
 	var offset int64
@@ -2544,6 +2547,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 	}
 	blb := o.getBlobSVC()
+	if (snapshotId != nil) {
+		blb, _ = blb.WithSnapshot(*snapshotId)
+	}
+
 	opt := blob.DownloadStreamOptions{
 		// When set to true and specified together with the Range, the service returns the MD5 hash for the range, as long as the
 		// range is less than or equal to 4 MB in size.
