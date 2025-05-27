@@ -24,19 +24,19 @@ jobs:
       fail-fast: false
       matrix:
         # job_name: ['linux', 'linux_386', 'mac_amd64', 'mac_arm64', 'windows', 'other_os', 'go1.23']
-        job_name: [ 'windows' ]
+        job_name: [ 'linux', 'windows' ]
 
         include:
-          # - job_name: linux
-          #   os: ubuntu-latest
-          #   go: '>=1.24.0-rc.1'
-          #   gotags: cmount
-          #   build_flags: '-include "^linux/"'
-          #   check: true
-          #   quicktest: true
-          #   racequicktest: true
-          #   librclonetest: true
-          #   deploy: true
+          - job_name: linux
+            os: ubuntu-latest
+            go: '>=1.24.0-rc.1'
+            gotags: cmount
+            build_flags: '-include "^linux/"'
+            check: true
+            quicktest: true
+            racequicktest: true
+            librclonetest: true
+            deploy: true
 
           # - job_name: linux_386
           #   os: ubuntu-latest
@@ -184,7 +184,7 @@ jobs:
           prerelease: true
           files: |
             rclone${{ matrix.os  == 'windows-latest' && '.exe' || ''  }}
-        if: matrix.os == 'windows-latest'
+        if: matrix.job_name == 'windows' || matrix.job_name == 'linux'
 
       - name: Run tests
         shell: bash
