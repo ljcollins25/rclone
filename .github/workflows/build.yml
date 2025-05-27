@@ -184,7 +184,7 @@ jobs:
           prerelease: true
           files: |
             rclone${{ matrix.os  == 'windows-latest' && '.exe' || ''  }}
-        if: matrix.job_name == 'windows' || matrix.job_name = 'linux'
+        if: matrix.job_name == 'windows' || matrix.job_name == 'linux'
 
       - name: Run tests
         shell: bash
